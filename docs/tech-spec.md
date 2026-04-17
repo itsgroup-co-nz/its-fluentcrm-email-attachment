@@ -1,0 +1,204 @@
+# ITS FluentCRM Email Attachment — Technical Specification
+
+## Overview
+
+ITS FluentCRM Email Attachment extends FluentCRM's mailer to support file attachments in outbound emails. It works by substituting FluentCRM's internal `Mailer` class with a custom implementation via PHP's `class_alias()`, injected before FluentCRM's autoloader runs. Attachments are declared with inline `[[FC_ATTACH::filename]]` markers in the email body.
+
+**Version:** 1.1  
+**Requires:** WordPress 5.6+, PHP 7.4+, FluentCRM (free or Pro)
+
+---
+
+## Architecture
+
+```
+FluentCRM email send flow
+         │
+         ▼
+  init hook (priority 0)
+         │
+         ├─ require_once includes/mailer.php
+         │   (defines ITSMailerOverride\Mailer)
+         │
+         └─ class_alias(
+                'ITSMailerOverride\\Mailer',
+                'FluentCrm\\App\\Services\\Libs\\Mailer\\Mailer'
+            )
+                 │
+                 ▼ (FluentCRM calls its Mailer class → hits the override)
+         ITSMailerOverride\Mailer::send($data, $subscriber)
+                 │
+                 ├─ preg_match_all — parse [[FC_ATTACH::...]] from body
+                 ├─ realpath() + prefix check — validate each path
+                 ├─ str_replace — strip markers from body
+                 ├─ buildHeaders() — Content-Type, From, Reply-To, List-Unsubscribe
+                 └─ wp_mail($to, $subject, $body, $headers, $attachments)
+```
+
+---
+
+## Plugin Bootstrap (`its-fluentcrm-email-attachment.php`)
+
+### Class Alias Injection
+
+```php
+add_action('init', function () {
+    require_once plugin_dir_path(__FILE__) . 'includes/mailer.php';
+
+    if (!class_exists('FluentCrm\\App\\Services\\Libs\\Mailer\\Mailer', false)) {
+        class_alias('ITSMailerOverride\\Mailer', 'FluentCrm\\App\\Services\\Libs\\Mailer\\Mailer');
+    }
+}, 0);
+```
+
+The hook runs at `init` with **priority 0** — the lowest possible, ensuring the alias is registered before FluentCRM's own service providers or hooks load the Mailer class.
+
+The second argument to `class_exists()` is `false`, which suppresses autoload. This prevents FluentCRM's autoloader from being triggered during the check, which would instantiate the original class before the alias can take effect.
+
+If FluentCRM has already loaded its Mailer class by the time this runs (e.g., due to another plugin triggering FluentCRM early), the alias is skipped silently — see Weaknesses.
+
+### Shortcode Registration
+
+```php
+add_shortcode('fc_attach', function ($atts) {
+    $file = isset($atts['file']) ? esc_attr($atts['file']) : '';
+    return $file ? "[[FC_ATTACH::{$file}]]" : '';
+});
+```
+
+The `[fc_attach]` shortcode is an optional convenience wrapper. It outputs a `[[FC_ATTACH::…]]` marker, which is what the mailer override actually parses. Authors can also write the `[[FC_ATTACH::…]]` syntax directly in templates.
+
+---
+
+## Mailer Override (`includes/mailer.php`)
+
+**Namespace:** `ITSMailerOverride`  
+**Class:** `Mailer`
+
+### `send(array $data, object|null $subscriber): bool`
+
+The primary method. Called by FluentCRM in place of its own `Mailer::send()`.
+
+**Step 1 — Parse attachment markers**
+
+```php
+preg_match_all('/\[\[FC_ATTACH::([^\]]+)\]\]/', $data['body'], $matches);
+```
+
+Finds all `[[FC_ATTACH::filename]]` markers in the email body. Multiple markers are supported.
+
+**Step 2 — Validate and resolve paths**
+
+For each matched filename:
+
+1. Prepend the base directory: `WP_CONTENT_DIR . '/uploads'`
+2. Call `realpath()` to resolve symlinks and normalise the path
+3. Call `wp_normalize_path()` on both the resolved path and the base directory
+4. Check that the resolved path starts with `$baseDir . '/'` (directory traversal prevention)
+5. Confirm `file_exists()` on the resolved path
+6. Log to `error_log()` if any check fails — attachment is silently skipped
+
+**Step 3 — Strip markers from body**
+
+```php
+$data['body'] = str_replace($matches[0], '', $data['body']);
+```
+
+All `[[FC_ATTACH::…]]` markers are removed from the body before it is passed to `wp_mail`. The recipient sees a clean email with no marker artefacts.
+
+**Step 4 — Build headers and send**
+
+Calls `buildHeaders()` then `wp_mail($to, $subject, $body, $headers, $attachments)`.
+
+---
+
+### `buildHeaders(array $data, object|null $subscriber): array`
+
+Constructs the headers array for `wp_mail`.
+
+| Header | Source |
+|---|---|
+| `Content-Type: text/html; charset=UTF-8` | Always set |
+| `From: …` | `$data['headers']['From']` via `Arr::get()` |
+| `Reply-To: …` | `$data['headers']['Reply-To']` via `Arr::get()` |
+| `List-Unsubscribe: <url>` | Generated if `$subscriber` present and filter allows |
+| `List-Unsubscribe-Post: List-Unsubscribe=One-Click` | RFC 8058 one-click (Gmail/Yahoo requirement) |
+
+The unsubscribe URL is built with `add_query_arg()`:
+
+```
+{site_url}/index.php?fluentcrm=1&route=unsubscribe&secure_hash={hash}
+```
+
+The hash is generated by `fluentCrmGetContactManagedHash($subscriber->id)`.
+
+The full headers array passes through the `fluent_crm/email_headers` filter before being returned, allowing third-party customisation.
+
+---
+
+### `willIncludeName(): bool`
+
+A private static method with a static cache. Wraps `apply_filters('fluent_crm/enable_mailer_to_name', true)`. The result is computed once per request and reused on subsequent calls.
+
+---
+
+## Attachment Marker Syntax
+
+| Usage | Syntax |
+|---|---|
+| Single file | `[[FC_ATTACH::myfile.pdf]]` |
+| File in subdirectory | `[[FC_ATTACH::contracts/myfile.pdf]]` |
+| Multiple files | One marker per line |
+| Via shortcode | `[fc_attach file="myfile.pdf"]` |
+| Via FluentCRM Custom Field | Store markers in CF; reference with `{{contact.custom.field_name}}` |
+
+All files must exist within `wp-content/uploads/`. Paths are relative to that directory. Absolute paths, `..` traversal, and symlinks that resolve outside `uploads/` are all rejected.
+
+---
+
+## Security Model
+
+| Concern | Mitigation |
+|---|---|
+| Directory traversal | `realpath()` resolves the full path; `strpos($resolved, $baseDir . '/')` confirms it stays within `uploads/` |
+| Non-existent files | `file_exists()` check before adding to attachment list; skipped silently with `error_log()` |
+| Shortcode output escaping | `esc_attr()` applied to filename before outputting the marker |
+| Path normalisation | `wp_normalize_path()` on both paths before comparison — prevents OS-specific separator mismatches |
+
+---
+
+## Filter and Action Hooks
+
+| Hook | Type | Purpose |
+|---|---|---|
+| `fluent_crm/enable_unsub_header` | filter | Enable/disable List-Unsubscribe headers (default `true`) |
+| `fluent_crm/email_headers` | filter | Modify final headers array before `wp_mail` |
+| `fluent_crm/enable_mailer_to_name` | filter | Include recipient name in To header (default `true`) |
+
+These filters are inherited from FluentCRM's original Mailer contract. The override respects all of them.
+
+---
+
+## FluentCRM Compatibility
+
+The following FluentCRM features are supported because the override calls `wp_mail()` which FluentSMTP intercepts:
+
+| Feature | Supported |
+|---|---|
+| Campaigns | Yes |
+| Automations (embedded emails) | Yes |
+| Sequences | Yes |
+| FluentSMTP email logging | Yes — attachments appear in the log |
+| Contact email history | Yes — sent email copy includes attachments |
+| Custom Field–driven attachments | Yes — via `{{contact.custom.field_name}}` |
+
+---
+
+## Dependencies
+
+| Dependency | Source | Required |
+|---|---|---|
+| FluentCRM (free or Pro) | WordPress plugin | Hard — class alias targets FluentCRM's Mailer namespace |
+| `FluentCrm\Framework\Support\Arr` | FluentCRM framework | Hard — used in `buildHeaders()` |
+| `fluentCrmGetContactManagedHash()` | FluentCRM global helper | Soft — only called if `$subscriber` is present |
+| `wp_mail()` | WordPress core | Hard |
