@@ -68,3 +68,14 @@ Multiple attachments can be added as follows:
 - Emails are sent using `wp_mail` including the files attached as standard document attachments.
 - If using FluentSMTP emails are logged and include the attachment(s).
 - FluentCRM Contact record includes a copy of the sent email, including the attached files.
+
+---
+
+## Contact ITS Group
+
+Website: https://itsgroup.co.nz
+
+Email:   info@itsgroup.co.nz
+
+Country: New Zealand
+
